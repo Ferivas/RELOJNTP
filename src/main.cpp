@@ -14,6 +14,7 @@ static const int PIN_A    = 14;
 static const int PIN_B    = 13;
 static const int PIN_BTN  = 18;   // Pulsante de brillo (a GND, flanco de bajada)
 static const int PIN_FONT = 19;   // Pulsante de fuente (a GND, flanco de bajada)
+static const int PIN_ANIM = 17;   // Pulsante de animación (a GND, flanco de bajada)
 
 // ==================== SETTINGS DEL PANEL ====================
 #define OE_ACTIVE_HIGH    1
@@ -84,6 +85,18 @@ void IRAM_ATTR onFontBtnFalling() {
     if ((uint32_t)(now - lastFontIsrMs) >= BTN_DEBOUNCE_MS) {
         lastFontIsrMs = now;
         fontBtnPressed = true;
+    }
+}
+
+// ==================== BOTÓN DE ANIMACIÓN (ISR + antirrebote) ====================
+static volatile bool animBtnPressed = false;
+static volatile uint32_t lastAnimIsrMs = 0;
+
+void IRAM_ATTR onAnimBtnFalling() {
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastAnimIsrMs) >= BTN_DEBOUNCE_MS) {
+        lastAnimIsrMs = now;
+        animBtnPressed = true;
     }
 }
 
@@ -162,17 +175,25 @@ void IRAM_ATTR onOeTimer() {
 }
 
 // ==================== DIBUJO ====================
-inline void setPixel(int x, int y, bool on) {
+inline void setPixBuf(uint32_t* fb, int x, int y, bool on) {
     if (x < 0 || x >= MATRIX_WIDTH || y < 0 || y >= MATRIX_HEIGHT) return;
-    if (on) framebuffer[y] |= (1UL << x);
-    else    framebuffer[y] &= ~(1UL << x);
+    if (on) fb[y] |= (1UL << x);
+    else    fb[y] &= ~(1UL << x);
+}
+
+inline void setPixel(int x, int y, bool on) {
+    setPixBuf((uint32_t*)framebuffer, x, y, on);
+}
+
+void clearBuf(uint32_t* fb) {
+    for (int i = 0; i < MATRIX_HEIGHT; i++) fb[i] = 0;
 }
 
 void clearFB() {
-    for (int i = 0; i < MATRIX_HEIGHT; i++) framebuffer[i] = 0;
+    clearBuf((uint32_t*)framebuffer);
 }
 
-void drawChar(int x, int y, char c) {
+void drawChar(uint32_t* fb, int x, int y, char c) {
     int idx = -1;
     if (c >= '0' && c <= '9') idx = c - '0';
     else if (c == ':') idx = 10;
@@ -188,30 +209,193 @@ void drawChar(int x, int y, char c) {
         for (int row = 0; row < f.height; row++) {
             int py = y + row;
             if (py < 0 || py >= MATRIX_HEIGHT) continue;
-            if (colData & (1 << row)) setPixel(px, py, true);
+            if (colData & (1 << row)) setPixBuf(fb, px, py, true);
         }
     }
 }
 
-void drawClock(uint8_t h, uint8_t m, bool showColon) {
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%02d%c%02d", h % 24, showColon ? ':' : ' ', m % 60);
-
+// Calcula la posición y separación de los caracteres del reloj
+void clockLayout(int& startX, int& startY, int& advance) {
     const Font& f = fonts[fontIndex];
     // Ancho total de "HH:MM": 5 caracteres con 1 px de separacion.
     // Si no cabe (fuente ancha), se dibujan sin separacion.
-    int advance = f.width + 1;
+    advance = f.width + 1;
     if (5 * advance - 1 > MATRIX_WIDTH) advance = f.width;
-    int startX = (MATRIX_WIDTH - (5 * advance - 1)) / 2;
+    startX = (MATRIX_WIDTH - (5 * advance - 1)) / 2;
     if (startX < 0) startX = 0;
-    int startY = (MATRIX_HEIGHT - f.height) / 2;
+    startY = (MATRIX_HEIGHT - f.height) / 2;
     if (startY < 0) startY = 0;
+}
 
-    clearFB();
+void renderClock(uint32_t* fb, uint8_t h, uint8_t m, bool showColon) {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d%c%02d", h % 24, showColon ? ':' : ' ', m % 60);
+
+    int startX, startY, advance;
+    clockLayout(startX, startY, advance);
+
+    clearBuf(fb);
     int cx = startX;
     for (const char* p = buf; *p; p++) {
-        drawChar(cx, startY, *p);
+        drawChar(fb, cx, startY, *p);
         cx += advance;
+    }
+}
+
+void drawClock(uint8_t h, uint8_t m, bool showColon) {
+    renderClock((uint32_t*)framebuffer, h, m, showColon);
+}
+
+// ==================== ANIMACIONES DE CAMBIO DE DÍGITO ====================
+// Un segundo antes de que cambie algun dígito se renderiza la hora actual
+// y la siguiente; luego, en pasos de 100 ms, se muestran los cuadros
+// intermedios. Tres tipos seleccionables con el botón del pin 17:
+//   0 - Scroll vertical: las filas del nuevo dígito desplazan a las del antiguo.
+//   1 - Scroll horizontal: las columnas del nuevo dígito desplazan a las del antiguo.
+//   2 - Disolución: los píxeles del dígito antiguo se apagan aleatoriamente
+//       y luego se encienden aleatoriamente los del nuevo.
+#define ANIM_FRAME_MS 100
+#define ANIM_DISSOLVE_STEPS 8   // 4 apagando + 4 encendiendo
+
+enum AnimType : uint8_t { ANIM_SCROLL_V = 0, ANIM_SCROLL_H = 1, ANIM_DISSOLVE = 2, ANIM_COUNT = 3 };
+static const char* animNames[ANIM_COUNT] = { "Scroll vertical", "Scroll horizontal", "Disolucion" };
+static volatile uint8_t animType = ANIM_SCROLL_V;
+
+static uint32_t oldFrame[MATRIX_HEIGHT];
+static uint32_t newFrame[MATRIX_HEIGHT];
+static uint32_t changeMask = 0;      // columnas donde cambia algun dígito
+static bool     animActive = false;
+static uint8_t  animStep = 0;
+static uint8_t  animMaxSteps = 0;
+static uint32_t nextAnimFrame = 0;
+
+// Listas de píxeles para la disolución (y<<5 | x), en orden aleatorio
+static uint16_t offList[MATRIX_WIDTH * MATRIX_HEIGHT];
+static uint16_t onList[MATRIX_WIDTH * MATRIX_HEIGHT];
+static int offCount = 0, onCount = 0;
+
+static void shuffle(uint16_t* list, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = random(0, i + 1);
+        uint16_t t = list[i]; list[i] = list[j]; list[j] = t;
+    }
+}
+
+void prepareAnimation(uint8_t h, uint8_t m) {
+    uint8_t m2 = (m + 1) % 60;
+    uint8_t h2 = (m == 59) ? (h + 1) % 24 : h;
+
+    renderClock(oldFrame, h, m, true);   // ambos con ':' para no congelar el parpadeo
+    renderClock(newFrame, h2, m2, true);
+
+    changeMask = 0;
+    for (int y = 0; y < MATRIX_HEIGHT; y++) changeMask |= oldFrame[y] ^ newFrame[y];
+    if (changeMask == 0) return;
+
+    const Font& f = fonts[fontIndex];
+    switch (animType) {
+        case ANIM_SCROLL_V: animMaxSteps = f.height; break;
+        case ANIM_SCROLL_H: animMaxSteps = f.width;  break;
+        default:            animMaxSteps = ANIM_DISSOLVE_STEPS; break;
+    }
+
+    if (animType == ANIM_DISSOLVE) {
+        // Píxeles que se apagan (estaban en el dígito antiguo) y se encienden
+        // (están en el nuevo). Los píxeles comunes quedan fijos.
+        offCount = 0; onCount = 0;
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            uint32_t off = oldFrame[y] & ~newFrame[y];
+            uint32_t on  = newFrame[y] & ~oldFrame[y];
+            for (int x = 0; x < MATRIX_WIDTH; x++) {
+                if (off & (1UL << x)) offList[offCount++] = (y << 5) | x;
+                if (on  & (1UL << x)) onList[onCount++]   = (y << 5) | x;
+            }
+        }
+        shuffle(offList, offCount);
+        shuffle(onList, onCount);
+    }
+
+    animActive = true;
+    animStep = 0;
+    nextAnimFrame = millis() + ANIM_FRAME_MS;
+}
+
+// Scroll vertical: las columnas que cambian se desplazan hacia arriba dentro
+// de la banda de los dígitos; el nuevo entra desde abajo.
+void composeScrollV(uint8_t k) {
+    const Font& f = fonts[fontIndex];
+    int bandY = (MATRIX_HEIGHT - f.height) / 2;
+    int H = f.height;
+
+    for (int y = 0; y < MATRIX_HEIGHT; y++) {
+        int ry = y - bandY;
+        uint32_t row = oldFrame[y];
+        if (ry >= 0 && ry < H) {
+            uint32_t scrolled = (ry < H - k) ? oldFrame[y + k] : newFrame[y + k - H];
+            row = (oldFrame[y] & ~changeMask) | (scrolled & changeMask);
+        }
+        framebuffer[y] = row;
+    }
+}
+
+// Scroll horizontal: dentro de cada dígito que cambia, las columnas se
+// desplazan a la izquierda; el nuevo dígito entra desde la derecha.
+void composeScrollH(uint8_t k) {
+    const Font& f = fonts[fontIndex];
+    int startX, startY, advance;
+    clockLayout(startX, startY, advance);
+    int W = f.width;
+
+    for (int y = 0; y < MATRIX_HEIGHT; y++) framebuffer[y] = oldFrame[y];
+
+    for (int slot = 0; slot < 5; slot++) {
+        int rx = startX + slot * advance;
+        // ¿cambia este dígito?
+        uint32_t slotMask = 0;
+        for (int x = rx; x < rx + W && x < MATRIX_WIDTH; x++) slotMask |= (1UL << x);
+        bool changed = false;
+        for (int y = 0; y < MATRIX_HEIGHT; y++)
+            if ((oldFrame[y] ^ newFrame[y]) & slotMask) { changed = true; break; }
+        if (!changed) continue;
+
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            uint32_t row = framebuffer[y];
+            for (int x = rx; x < rx + W && x < MATRIX_WIDTH; x++) {
+                int dx = x - rx;
+                bool bit = (dx < W - k)
+                    ? ((oldFrame[y] >> (x + k)) & 1)
+                    : ((newFrame[y] >> (x + k - W)) & 1);
+                if (bit) row |= (1UL << x);
+                else     row &= ~(1UL << x);
+            }
+            framebuffer[y] = row;
+        }
+    }
+}
+
+// Disolución: primera mitad apaga píxeles del dígito antiguo en orden
+// aleatorio; segunda mitad enciende los del nuevo, también aleatoriamente.
+void composeDissolve(uint8_t k) {
+    int half = ANIM_DISSOLVE_STEPS / 2;
+    if (k <= half) {
+        int n = (int)((int32_t)k * offCount / half);
+        for (int y = 0; y < MATRIX_HEIGHT; y++) framebuffer[y] = oldFrame[y];
+        for (int i = 0; i < n; i++)
+            framebuffer[offList[i] >> 5] &= ~(1UL << (offList[i] & 0x1F));
+    } else {
+        int n = (int)((int32_t)(k - half) * onCount / half);
+        for (int y = 0; y < MATRIX_HEIGHT; y++)
+            framebuffer[y] = oldFrame[y] & newFrame[y];  // píxeles comunes fijos
+        for (int i = 0; i < n; i++)
+            framebuffer[onList[i] >> 5] |= (1UL << (onList[i] & 0x1F));
+    }
+}
+
+void composeAnimFrame(uint8_t k) {
+    switch (animType) {
+        case ANIM_SCROLL_V: composeScrollV(k);  break;
+        case ANIM_SCROLL_H: composeScrollH(k);  break;
+        default:            composeDissolve(k); break;
     }
 }
 
@@ -259,9 +443,11 @@ void setup() {
     prefs.begin("clock", true);
     uint8_t savedBr = prefs.getUChar("brightness", BR_HIGH);
     uint8_t savedFont = prefs.getUChar("font", 0);
+    uint8_t savedAnim = prefs.getUChar("anim", ANIM_SCROLL_V);
     prefs.end();
     if (savedBr < BR_COUNT) brightness = savedBr;
     if (savedFont < FONT_COUNT) fontIndex = savedFont;
+    if (savedAnim < ANIM_COUNT) animType = savedAnim;
 
     // Botón de brillo: interrupción por flanco de bajada (pulsante a GND)
     pinMode(PIN_BTN, INPUT_PULLUP);
@@ -270,6 +456,10 @@ void setup() {
     // Botón de fuente: interrupción por flanco de bajada (pulsante a GND)
     pinMode(PIN_FONT, INPUT_PULLUP);
     attachInterrupt(PIN_FONT, onFontBtnFalling, FALLING);
+
+    // Botón de animación: interrupción por flanco de bajada (pulsante a GND)
+    pinMode(PIN_ANIM, INPUT_PULLUP);
+    attachInterrupt(PIN_ANIM, onAnimBtnFalling, FALLING);
 
     // Timer de apagado de OE para el PWM de brillo (one-shot, se rearma en cada scan)
     oeTimer = timerBegin(1, 80, true);
@@ -348,6 +538,16 @@ void loop() {
         Serial.printf("Fuente: %s\n", fonts[fontIndex].name);
     }
 
+    // 0c) BOTÓN DE ANIMACIÓN: cicla scroll vertical -> horizontal -> disolución
+    if (animBtnPressed) {
+        animBtnPressed = false;
+        animType = (animType + 1) % ANIM_COUNT;
+        prefs.begin("clock", false);
+        prefs.putUChar("anim", animType);
+        prefs.end();
+        Serial.printf("Animacion: %s\n", animNames[animType]);
+    }
+
     // 1) PARPADEO DE ARRANQUE: 1 LED en el centro de la matriz
     //    mientras no haya WiFi (mínimo consumo de corriente).
     bool wifiNow = (WiFi.status() == WL_CONNECTED);
@@ -392,8 +592,19 @@ void loop() {
         }
     }
 
-    // 6) ACTUALIZAR RELOJ (una vez por segundo)
+    // 6) ANIMACIÓN DE CAMBIO DE DÍGITO (cuadros cada 100 ms)
     uint32_t ms = millis();
+    if (animActive && (int32_t)(ms - nextAnimFrame) >= 0) {
+        nextAnimFrame = ms + ANIM_FRAME_MS;
+        animStep++;
+        if (animStep >= animMaxSteps) {
+            animActive = false;  // el siguiente tick de segundo dibuja la hora final
+        } else {
+            composeAnimFrame(animStep);
+        }
+    }
+
+    // 7) ACTUALIZAR RELOJ (una vez por segundo)
     if ((int32_t)(ms - nextSecond) >= 0) {
         nextSecond = ms + 1000;
         colonOn = !colonOn;
@@ -425,7 +636,14 @@ void loop() {
 
         // CORRECCIÓN: Redibujar SIEMPRE cada segundo para que los dos puntos parpadeen
         lastHH = h; lastMM = m;
-        drawClock(h, m, colonOn);
+        if (s == 59 && !animActive) {
+            // Un segundo antes del cambio de dígito: preparar la animación.
+            // Si hay dígitos que cambian, la animación reemplaza al dibujo normal.
+            prepareAnimation(h, m);
+            if (!animActive) drawClock(h, m, colonOn);
+        } else if (!animActive) {
+            drawClock(h, m, colonOn);
+        }
 
         // Serial solo cuando cambia el minuto (para no spammear)
         if (s == 0) {
